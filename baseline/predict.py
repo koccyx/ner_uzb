@@ -16,12 +16,13 @@ from .common import (
     JsonObject,
     ModelFeature,
     Offsets,
-    decode_bio_tokens,
+    decode_bilou_tokens,
     load_fast_tokenizer,
     read_records,
     resolve_device,
     tokenize_windows,
     validate_window,
+    viterbi_decode,
 )
 
 Window = tuple[int, ModelFeature, Offsets]
@@ -66,7 +67,7 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 def _model_labels(model: torch.nn.Module) -> dict[int, str]:
-    """Извлекает и проверяет BIO-метки из model config."""
+    """Извлекает и проверяет BILOU-метки из model config."""
 
     labels = {int(index): str(label) for index, label in model.config.id2label.items()}
     expected = set(TAGS)
@@ -150,14 +151,25 @@ def _decode_records(
 
     predictions: list[JsonObject] = []
     for record, record_scores in zip(records, scores, strict=True):
-        tagged_tokens = []
-        for (start, end), (score_sum, count) in sorted(record_scores.items()):
-            label_id = int((score_sum / count).argmax().item())
-            tagged_tokens.append((start, end, id2label[label_id]))
+        ordered_scores = sorted(record_scores.items())
+        if ordered_scores:
+            averaged_probabilities = torch.stack(
+                [score_sum / count for _, (score_sum, count) in ordered_scores]
+            )
+            emissions = averaged_probabilities.clamp_min(
+                torch.finfo(averaged_probabilities.dtype).tiny
+            ).log()
+            tags = viterbi_decode(emissions, id2label)
+        else:
+            tags = []
+        tagged_tokens = [
+            (start, end, tag)
+            for (((start, end), _), tag) in zip(ordered_scores, tags, strict=True)
+        ]
         predictions.append(
             {
                 "hash": record["hash"],
-                "entities": decode_bio_tokens(tagged_tokens),
+                "entities": decode_bilou_tokens(tagged_tokens),
             }
         )
     return predictions

@@ -278,9 +278,11 @@ def run(args: argparse.Namespace) -> Path:
     history: list[dict[str, float | int]] = []
     best_dev_loss = float("inf")
     baseline_config = {
-        "schema_version": 1,
+        "schema_version": 2,
         "base_model": args.model_name,
         "tags": list(TAGS),
+        "tagging_scheme": "BILOU",
+        "decoder": "constrained_viterbi",
         "max_length": args.max_length,
         "stride": args.stride,
         "seed": args.seed,

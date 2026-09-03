@@ -15,10 +15,16 @@ TAGS = (
     "O",
     "B-ORG",
     "I-ORG",
+    "L-ORG",
+    "U-ORG",
     "B-NAME",
     "I-NAME",
+    "L-NAME",
+    "U-NAME",
     "B-GEO",
     "I-GEO",
+    "L-GEO",
+    "U-GEO",
 )
 TAG_TO_ID = {tag: index for index, tag in enumerate(TAGS)}
 DEFAULT_MODEL = "distilbert/distilbert-base-multilingual-cased"
@@ -204,7 +210,7 @@ def tokenize_windows(
 
 
 def align_labels(offsets: Offsets, entities: list[JsonObject]) -> list[int]:
-    """Переводит символьные spans в BIO-метки токенов одного окна."""
+    """Переводит символьные spans в BILOU-метки токенов одного окна."""
 
     labels: list[int] = []
     entity_index = 0
@@ -222,13 +228,22 @@ def align_labels(offsets: Offsets, entities: list[JsonObject]) -> list[int]:
         if end <= entity["start"] or start >= entity["end"]:
             labels.append(TAG_TO_ID["O"])
             continue
-        prefix = "B" if start <= entity["start"] < end else "I"
+        is_first = start <= entity["start"] < end
+        is_last = start < entity["end"] <= end
+        if is_first and is_last:
+            prefix = "U"
+        elif is_first:
+            prefix = "B"
+        elif is_last:
+            prefix = "L"
+        else:
+            prefix = "I"
         labels.append(TAG_TO_ID[f"{prefix}-{entity['label']}"])
     return labels
 
 
 class TokenizedNerDataset(Dataset):
-    """Набор токенизированных sliding windows с BIO-метками."""
+    """Набор токенизированных sliding windows с BILOU-метками."""
 
     def __init__(
         self,
@@ -269,8 +284,100 @@ class TokenizedNerDataset(Dataset):
         return self.features[index]
 
 
-def decode_bio_tokens(tokens: list[tuple[int, int, str]]) -> list[JsonObject]:
-    """Собирает символьные spans из упорядоченных BIO-предсказаний токенов."""
+def _split_bilou_tag(tag: str) -> tuple[str, str | None]:
+    """Разбирает тег и проверяет принадлежность схеме BILOU."""
+
+    if tag == "O":
+        return "O", None
+    prefix, separator, label = tag.partition("-")
+    if separator != "-" or prefix not in {"B", "I", "L", "U"} or label not in ENTITY_LABELS:
+        raise ValueError(f"unsupported BILOU tag {tag!r}")
+    return prefix, label
+
+
+def _valid_bilou_transition(previous: str, current: str) -> bool:
+    """Проверяет допустимость перехода между двумя BILOU-тегами."""
+
+    previous_prefix, previous_label = _split_bilou_tag(previous)
+    current_prefix, current_label = _split_bilou_tag(current)
+    if previous_prefix in {"O", "L", "U"}:
+        return current_prefix in {"O", "B", "U"}
+    return current_prefix in {"I", "L"} and current_label == previous_label
+
+
+def viterbi_decode(
+    emission_scores: torch.Tensor,
+    id2label: dict[int, str],
+) -> list[str]:
+    """Находит наиболее вероятную допустимую BILOU-последовательность."""
+
+    if emission_scores.ndim != 2:
+        raise ValueError("emission_scores must have shape [tokens, labels]")
+    token_count, label_count = emission_scores.shape
+    if label_count != len(id2label) or set(id2label) != set(range(label_count)):
+        raise ValueError("id2label must cover every emission column")
+    labels = [id2label[index] for index in range(label_count)]
+    for label in labels:
+        _split_bilou_tag(label)
+    if token_count == 0:
+        return []
+
+    scores = emission_scores.float()
+    negative_infinity = torch.tensor(
+        float("-inf"),
+        dtype=scores.dtype,
+        device=scores.device,
+    )
+    start_scores = torch.tensor(
+        [
+            0.0
+            if _split_bilou_tag(label)[0] in {"O", "B", "U"}
+            else float("-inf")
+            for label in labels
+        ],
+        dtype=scores.dtype,
+        device=scores.device,
+    )
+    end_scores = torch.tensor(
+        [
+            0.0
+            if _split_bilou_tag(label)[0] in {"O", "L", "U"}
+            else float("-inf")
+            for label in labels
+        ],
+        dtype=scores.dtype,
+        device=scores.device,
+    )
+    transitions = torch.full(
+        (label_count, label_count),
+        negative_infinity,
+        dtype=scores.dtype,
+        device=scores.device,
+    )
+    for previous_id, previous in enumerate(labels):
+        for current_id, current in enumerate(labels):
+            if _valid_bilou_transition(previous, current):
+                transitions[previous_id, current_id] = 0.0
+
+    path_scores = scores[0] + start_scores
+    backpointers: list[torch.Tensor] = []
+    for token_index in range(1, token_count):
+        candidates = path_scores.unsqueeze(1) + transitions
+        best_previous_scores, best_previous_ids = candidates.max(dim=0)
+        path_scores = best_previous_scores + scores[token_index]
+        backpointers.append(best_previous_ids)
+
+    best_last_id = int((path_scores + end_scores).argmax().item())
+    best_path = [best_last_id]
+    for pointers in reversed(backpointers):
+        best_last_id = int(pointers[best_last_id].item())
+        best_path.append(best_last_id)
+    best_path.reverse()
+    return [labels[label_id] for label_id in best_path]
+
+
+def decode_bilou_tokens(tokens: list[tuple[int, int, str]]) -> list[JsonObject]:
+    """Собирает символьные spans из допустимой BILOU-последовательности."""
 
     entities: list[JsonObject] = []
     current: JsonObject | None = None
@@ -285,16 +392,26 @@ def decode_bio_tokens(tokens: list[tuple[int, int, str]]) -> list[JsonObject]:
 
     for start, end, tag in tokens:
         if tag == "O":
-            flush()
+            if current is not None:
+                raise ValueError("invalid BILOU sequence: entity is not closed with L")
             continue
-        prefix, separator, label = tag.partition("-")
-        if separator != "-" or prefix not in {"B", "I"} or label not in ENTITY_LABELS:
-            raise ValueError(f"model returned unsupported tag {tag!r}")
-
-        if prefix == "B" or current is None or current["label"] != label:
-            flush()
+        prefix, label = _split_bilou_tag(tag)
+        if prefix == "U":
+            if current is not None:
+                raise ValueError(f"invalid BILOU sequence at tag {tag!r}")
             current = {"label": label, "start": start, "end": end}
+            flush()
+        elif prefix == "B":
+            if current is not None:
+                raise ValueError(f"invalid BILOU sequence at tag {tag!r}")
+            current = {"label": label, "start": start, "end": end}
+        elif current is None or current["label"] != label:
+            raise ValueError(f"invalid BILOU sequence at tag {tag!r}")
         else:
             current["end"] = max(current["end"], end)
+            if prefix == "L":
+                flush()
+    if current is not None:
+        raise ValueError("invalid BILOU sequence: entity is not closed with L")
     flush()
     return entities
